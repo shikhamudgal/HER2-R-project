@@ -1,0 +1,778 @@
+###The demofiles contain information about the follow up times and event times of the four data series. (t.dmfs is the follow up time as given in the GEO web site, e.dmfs is the event)
+###For GSE7390, the follow up and events correspond to t.tdm and e.tdm in the file given in the GEO website; as metastasis is the event. 
+options(stringsAsFactors = FALSE)
+
+library(GEOquery)
+library(affy)
+library(hgu133a.db)
+library(Biobase)
+library(genefu)
+library(survival)
+library(coxme)
+library(WGCNA)
+library(frma)
+
+## The PAM50 SSP was used in the study, with traditional scaling of the gene expressions.
+data(pam50.scale)
+###The AURKA module signature is calculated from the list mod1
+data(mod1)
+##### Untar the raw data of the data series to their respective directories. 
+#####MAINZ is used for GSE11121
+#####TRANSBIG is used for GSE7390
+#####EMC1 is used for GSE2034
+#####EMC2 is used for GSE5327
+untar("GSE11121_RAW.tar", exdir="MAINZ")
+untar("GSE7390_RAW.tar", exdir="TRANSBIG")
+untar("GSE2034_RAW.tar", exdir="EMC1")
+untar("GSE5327_RAW.tar", exdir="EMC2")
+
+#### The CEL files are in .gz format, so a they have to be gunzipped further. 
+####For GSE7390. the CEL files are listed as .cel (in small characters)
+celsmainz=list.files("MAINZ/",pattern="CEL")
+sapply(paste("MAINZ", celsmainz, sep="/"), gunzip)
+celsmainz=list.files("MAINZ/",pattern="CEL")
+celstransbig=list.files("TRANSBIG/", pattern="cel")
+sapply(paste("TRANSBIG", celstransbig, sep="/"), gunzip)
+celstransbig=list.files("TRANSBIG/", pattern="cel")
+celsemc1=list.files("EMC1/",pattern="CEL")
+sapply(paste("EMC1", celsemc1, sep="/"), gunzip)
+celsemc1=list.files("EMC1/",pattern="CEL")
+celsemc2=list.files("EMC2/",pattern="CEL")
+sapply(paste("EMC2", celsemc2, sep="/"), gunzip)
+celsemc2=list.files("EMC2/",pattern="CEL")
+
+setwd(paste(getwd(),"/MAINZ",sep=""))
+mainzaffy=ReadAffy(filenames=celsmainz)
+mainzdata=frma(mainzaffy)
+
+setwd(paste(getwd(),"/TRANSBIG",sep=""))
+transbigaffy=ReadAffy(filenames=celstransbig)
+transbigdata=frma(transbigaffy)
+
+setwd(paste(getwd(),"/EMC1",sep=""))
+emc1affy=ReadAffy(filenames=celsemc1)
+emc1data=frma(emc1affy)
+
+setwd(paste(getwd(),"/EMC2",sep=""))
+emc2affy=ReadAffy(filenames=celsemc2)
+emc2data=frma(emc2affy)
+
+load("demo.RData")
+
+
+#### The expression data are then combined into a large data frame
+combmatrix=cbind(exprs(mainzdata),exprs(transbigdata),exprs(emc1data),exprs(emc2data))
+combmatrix=as.data.frame(combmatrix)
+#### The colnames of the data frame are modified to remove the ".cel" extension , 
+####to make it equivalent to row names of the data frame containing the information about the follow up, events and scan dates. These data frames will be combined later using these names 
+colnames(combmatrix)=gsub(".cel","",colnames(combmatrix),ignore.case=TRUE)
+
+####For subsequent analysis, we need a mapping between the probes and the entez gene id. All the series are are conducted on the Hgu133a affymetrix platform
+####So we use the hgu133aENTREZID function to obtain such a mapping. The  
+
+x <- hgu133aENTREZID
+mapped_probes <- mappedkeys(x)
+xx <- as.data.frame(x[mapped_probes])
+#### The intrinsic cluster prediction and the AURKA module function in the package "genefu" requires that the Entrez Gene ID be labelled as "EntrezGene.ID", 
+####and the probe id as "probe" 
+xx$EntrezGene.ID=as.character(xx$gene_id)
+xx$probe=xx$probe_id
+row.names(xx)=xx$probe_id
+
+####The intrinsic cluster prediction and the AURKA module function in the package "genefu" also requires that the expression data be arranged in such a way 
+####that the probes form the columns. Therefore the expression data that were extracted have to be transposed 
+combmatrix=t(combmatrix)
+
+#### The intrinsic cluster predict function is used to estimate the molecular subtypes and a data frame containing the predictions is created. 
+####The PAM50 SSP is used on scaled gene expressions.
+pamcomb=intrinsic.cluster.predict(sbt.model=pam50.scale, data=combmatrix, annot=xx, do.mapping = TRUE,do.prediction.strength = FALSE, verbose = FALSE)$subtype
+pamtot=as.data.frame(pamcomb)
+pamtot$Samplename=row.names(pamtot)
+#### The data frame containing the predicted molecular subtypes are then merged with the data frame containing the information about the Scan date, follow up and events
+demo$Samplename=demo$Samplename.x
+totscan=merge(demo, pamtot, by="Samplename")
+row.names(totscan)=totscan$Samplename
+
+#### The data frames containing the expression data are then merged with the data frame with information about the molecular subtypes, scan date and follow up times
+totcomb=merge(combmatrix,totscan, by="row.names")
+row.names(totcomb)=totcomb$Row.names
+totcomb$Row.names=NULL
+
+##### The AURKA module score is calculated, saved to a data frame which is then merged with the data frame containing the expression data along with the information 
+#####regarding the subtypes, scan date and follow up and events
+aurka=sig.score(x=mod1$AURKA, data=combmatrix, annot=xx, do.mapping = TRUE)$score
+aurkatot=as.data.frame(aurka)
+aurkatot$Samplename=row.names(aurkatot)
+totcomb=merge(totcomb,aurkatot, by="row.names")
+row.names(totcomb)=totcomb$Row.names
+totcomb$Row.names=NULL
+
+#### The follow up times in the different series are given using different units . For GSE7390 (series = TRANSBIG), it is given as days while for the others it is given as months
+#### So, all the follow up times are converted to years. (t.dmfs is the follow up time, e.dmfs is the event)
+totcomb$years=with(totcomb, ifelse(series=="TRANSBIG", t.dmfs/365,t.dmfs/12))
+#### The follow up times are then censored at 10 years
+totcomb$tdmfs=with(totcomb,ifelse(years>10,10,years))
+#### Any events after 10 years are censored 
+totcomb$edmfs=with(totcomb,ifelse(e.dmfs*years>10, 0,e.dmfs))
+
+#### The data for the different major subtypes are separated.
+dataBasal=subset(totcomb, subset=pamcomb=="Basal")
+dataHer2=subset(totcomb, subset=pamcomb=="Her2")
+dataLumA=subset(totcomb, subset=pamcomb=="LumA")
+dataLumB=subset(totcomb, subset=pamcomb=="LumB")
+
+#### The following variables are needed by WGCNA package for collapsing probes to genes
+probes=xx$probe_id
+genes=xx$gene_id
+
+#####################################################################
+#######  Analysis on the entire combined data (Univariate)###########
+##################################################################### 
+
+#### The expression data and the other data are then separated, since only the expression data will be used for collapsing the probes to genes
+zz=length(colnames(totcomb))
+data=totcomb[,c(1:22283)] #### expression data
+demo=totcomb[,c(22284:zz)]
+
+##### For the collapsing the probes are supposed to be in rows and the samples in columns, so the data has to be transposed
+data=t(data)
+
+#### Only that data representing the probes having a mapping to a Entrez Gene ID are kept. 
+data=data[c(row.names(data) %in% probes),]
+#### The probes are then collapsed to genes. The gene names are represented in the row names
+datacol=(collapseRows(data,genes,probes))[[1]]
+#### The number of genes finally the data is collapsed to 
+len=length(row.names(datacol))
+#### The collapsed  expression data is to be transposed again so that the genes are in the columns which is needed for the cox regression that is to follow
+datacol=t(datacol)
+#### The expression data for the genes are then merged again with the data containing the estimated molecular subtypes, AURKA score, scan date and follow up and event times
+datacol=merge(datacol, demo, by="row.names")
+row.names(datacol)=datacol$Row.names
+datacol$Row.names=NULL 
+
+####Make an empty matrix to store results
+resmat=matrix(nrow=len, ncol=19)
+
+####Model with the scan date serving as a proxy for batch and controlled as a random effects variable in a mixed effects Cox model. 
+#### The Cox regression coefficients along with the z score and the AIC of the model are calculated for each gene through a loop and the values entered into the empty matrix
+
+####Model (i): for just the batch effects modeled as a random variable 
+for(i in 1:len){
+         coxcombunivlistrandombatch=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|chrdate), data=datacol)
+                 resmat[c(i),c(1)]=fixef(coxcombunivlistrandombatch)
+		 resmat[c(i),c(2)]=resmat[c(i),c(1)]/sqrt(diag(vcov(coxcombunivlistrandombatch)))
+		 resmat[c(i),c(3)]=-2*(coxcombunivlistrandombatch$loglik[2])+2*coxcombunivlistrandombatch$df[1]
+   }
+
+####Model (ii): For the study series modeled as a random variable
+for(i in 1:len){
+         coxcombunivlistrandomseries=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series), data=datacol)
+                 resmat[c(i),c(4)]=fixef(coxcombunivlistrandomseries)
+		 resmat[c(i),c(5)]=resmat[c(i),c(4)]/sqrt(diag(vcov(coxcombunivlistrandomseries)))
+		 resmat[c(i),c(6)]=-2*(coxcombunivlistrandomseries$loglik[2])+2*coxcombunivlistrandomseries$df[1]
+   }
+
+####Model (iii): For the institution modeled as a random variable
+for(i in 1:len){
+         coxcombunivlistrandominstitution=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution), data=datacol)
+                 resmat[c(i),c(7)]=fixef(coxcombunivlistrandominstitution)
+		 resmat[c(i),c(8)]=resmat[c(i),c(7)]/sqrt(diag(vcov(coxcombunivlistrandominstitution)))
+		 resmat[c(i),c(9)]=-2*(coxcombunivlistrandominstitution$loglik[2])+2*coxcombunivlistrandominstitution$df[1]
+   }
+
+####Model (iv): For the batch (as estimated from scan date) nested within the series modeled as a random variable
+for(i in 1:len){
+         coxcombunivlistrandomnested1=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series/chrdate), data=datacol)
+                 resmat[c(i),c(10)]=fixef(coxcombunivlistrandomnested1)
+		 resmat[c(i),c(11)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxcombunivlistrandomnested1)))
+		 resmat[c(i),c(12)]=-2*(coxcombunivlistrandomnested1$loglik[2])+2*coxcombunivlistrandomnested1$df[1]
+   }
+
+####Model (v): For the batch (as estimated from scan date) nested within the institution modeled as a random variable
+for(i in 1:len){
+         coxcombunivlistrandomnested2=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution/chrdate), data=datacol)
+                 resmat[c(i),c(13)]=fixef(coxcombunivlistrandomnested2)
+		 resmat[c(i),c(14)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxcombunivlistrandomnested2)))
+		 resmat[c(i),c(15)]=-2*(coxcombunivlistrandomnested2$loglik[2])+2*coxcombunivlistrandomnested2$df[1]
+   }
+
+####Model (vi): A marginal model. 
+for(i in 1:len){
+         coxcombunivlistmarg=coxph(Surv(tdmfs,edmfs)~datacol[,c(i)] +cluster(chrdate), data=datacol)
+		 resmat[c(i),c(16)]=summary(coxcombunivlistmarg)$coefficients[1,1]
+		 resmat[c(i),c(17)]=summary(coxcombunivlistmarg)$coefficients[1,4]
+		 resmat[c(i),c(18)]=-2*(coxcombunivlistmarg$loglik[2])+2 
+                 resmat[c(i),c(19)]=-2*(coxcombunivlistmarg$loglik[1])
+   }
+
+####The columns of the matrix are named
+colnames(resmat)=c("coefbatch","zscorebatch","AICbatch","coefseries","zscoreseries","AICseries","coefinstitution","zscoreinstitution","AICinstitution","coefnestedseries",
+                      "zscorenestedseries","AICnestedseries","coefnestedinstitution", "zscorenestedinstitution","AICnestedinstitution","coefmarginal","zscoremarginal","AICmarginal","AICnull")
+
+####The results are stored
+resmatcombuniv=as.data.frame(resmat)
+resmatcombuniv$gene=colnames(datacol)[1:len]
+write.csv(resmatcombuniv, "resmatcombuniv.csv")
+
+############################################################################
+#######  Analysis on the entire combined data adjusted for AURKA ###########
+############################################################################ 
+
+#### The expression data and the other data are then separated, since only the expression data will be used for collapsing the probes to genes
+zz=length(colnames(totcomb))
+data=totcomb[,c(1:22283)] #### expression data
+demo=totcomb[,c(22284:zz)]
+
+##### For the collapsing the probes are supposed to be in rows and the samples in columns, so the data has to be transposed
+data=t(data)
+
+#### Only that data representing the probes having a mapping to a Entrez Gene ID are kept. 
+data=data[c(row.names(data) %in% probes),]
+#### The probes are then collapsed to genes. The gene names are represented in the row names
+datacol=(collapseRows(data,genes,probes))[[1]]
+#### The number of genes finally the data is collapsed to 
+len=length(row.names(datacol))
+#### The collapsed  expression data is to be transposed again so that the genes are in the columns which is needed for the cox regression that is to follow
+datacol=t(datacol)
+#### The expression data for the genes are then merged again with the data containing the estimated molecular subtypes, AURKA score, scan date and follow up and event times
+datacol=merge(datacol, demo, by="row.names")
+row.names(datacol)=datacol$Row.names
+datacol$Row.names=NULL 
+
+####Make an empty matrix to store results
+resmat=matrix(nrow=len, ncol=19)
+
+####Model with the scan date serving as a proxy for batch and controlled as a random effects variable in a mixed effects Cox model. 
+#### The Cox regression coefficients along with the z score and the AIC of the model are calculated for each gene through a loop and the values entered into the empty matrix
+
+####Model (i): for just the batch effects modeled as a random variable 
+for(i in 1:len){
+         coxaurkalistrandombatch=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+aurka+(1|chrdate), data=datacol)
+                 resmat[c(i),c(1)]=fixef(coxaurkalistrandombatch)[1]
+		 resmat[c(i),c(2)]=resmat[c(i),c(1)]/sqrt(diag(vcov(coxaurkalistrandombatch)))[1]
+		 resmat[c(i),c(3)]=-2*(coxaurkalistrandombatch$loglik[2])+2*coxaurkalistrandombatch$df[1]
+   }
+
+####Model (ii): For the study series modeled as a random variable
+for(i in 1:len){
+         coxaurkalistrandomseries=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+aurka+(1|series), data=datacol)
+                 resmat[c(i),c(4)]=fixef(coxaurkalistrandomseries)[1]
+		 resmat[c(i),c(5)]=resmat[c(i),c(4)]/sqrt(diag(vcov(coxaurkalistrandomseries)))[1]
+		 resmat[c(i),c(6)]=-2*(coxaurkalistrandomseries$loglik[2])+2*coxaurkalistrandomseries$df[1]
+   }
+
+####Model (iii): For the institution modeled as a random variable
+for(i in 1:len){
+         coxaurkalistrandominstitution=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+aurka+(1|institution), data=datacol)
+                 resmat[c(i),c(7)]=fixef(coxaurkalistrandominstitution)[1]
+		 resmat[c(i),c(8)]=resmat[c(i),c(7)]/sqrt(diag(vcov(coxaurkalistrandominstitution)))[1]
+		 resmat[c(i),c(9)]=-2*(coxaurkalistrandominstitution$loglik[2])+2*coxaurkalistrandominstitution$df[1]
+   }
+
+####Model (iv): For the batch (as estimated from scan date) nested within the series modeled as a random variable
+for(i in 1:len){
+         coxaurkalistrandomnested1=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+aurka+(1|series/chrdate), data=datacol)
+                 resmat[c(i),c(10)]=fixef(coxaurkalistrandomnested1)[1]
+		 resmat[c(i),c(11)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxaurkalistrandomnested1)))[1]
+		 resmat[c(i),c(12)]=-2*(coxaurkalistrandomnested1$loglik[2])+2*coxaurkalistrandomnested1$df[1]
+   }
+
+####Model (v): For the batch (as estimated from scan date) nested within the institution modeled as a random variable
+for(i in 1:len){
+         coxaurkalistrandomnested2=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+aurka+(1|institution/chrdate), data=datacol)
+                 resmat[c(i),c(13)]=fixef(coxaurkalistrandomnested2)[1]
+		 resmat[c(i),c(14)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxaurkalistrandomnested2)))[1]
+		 resmat[c(i),c(15)]=-2*(coxaurkalistrandomnested2$loglik[2])+2*coxaurkalistrandomnested2$df[1]
+   }
+
+####Model (vi): A marginal model. 
+for(i in 1:len){
+         coxaurkalistmarg=coxph(Surv(tdmfs,edmfs)~datacol[,c(i)] +aurka +cluster(chrdate), data=datacol)
+		 resmat[c(i),c(16)]=summary(coxaurkalistmarg)$coefficients[1,1]
+		 resmat[c(i),c(17)]=summary(coxaurkalistmarg)$coefficients[1,4]
+		 resmat[c(i),c(18)]=-2*(coxaurkalistmarg$loglik[2])+2*2 
+                 resmat[c(i),c(19)]=-2*(coxaurkalistmarg$loglik[1])
+   }
+
+####The columns of the matrix are named
+colnames(resmat)=c("coefbatch","zscorebatch","AICbatch","coefseries","zscoreseries","AICseries","coefinstitution","zscoreinstitution","AICinstitution","coefnestedseries",
+                      "zscorenestedseries","AICnestedseries","coefnestedinstitution", "zscorenestedinstitution","AICnestedinstitution","coefmarginal","zscoremarginal","AICmarginal","AICnull")
+
+####The results are stored
+resmataurka=as.data.frame(resmat)
+resmataurka$gene=colnames(datacol)[1:len]
+write.csv(resmataurka, "resmataurka.csv")
+
+
+
+
+
+#################################################
+#######  Analysis for Her2 subtype   ###########
+################################################# 
+
+#### The expression data and the other data are then separated, since only the expression data will be used for collapsing the probes to genes
+zz=length(colnames(dataHer2))
+data=dataHer2[,c(1:22283)] #### expression data
+demo=dataHer2[,c(22284:zz)]
+
+##### For the collapsing the probes are supposed to be in rows and the samples in columns, so the data has to be transposed
+data=t(data)
+
+#### Only that data representing the probes having a mapping to a Entrez Gene ID are kept. 
+data=data[c(row.names(data) %in% probes),]
+#### The probes are then collapsed to genes. The gene names are represented in the row names
+datacol=(collapseRows(data,genes,probes))[[1]]
+#### The number of genes finally the data is collapsed to 
+len=length(row.names(datacol))
+#### The collapsed  expression data is to be transposed again so that the genes are in the columns which is needed for the cox regression that is to follow
+datacol=t(datacol)
+#### The expression data for the genes are then merged again with the data containing the estimated molecular subtypes, AURKA score, scan date and follow up and event times
+datacol=merge(datacol, demo, by="row.names")
+row.names(datacol)=datacol$Row.names
+datacol$Row.names=NULL 
+
+####Make an empty matrix to store results
+resmat=matrix(nrow=len, ncol=19)
+
+####Model with the scan date serving as a proxy for batch and controlled as a random effects variable in a mixed effects Cox model. 
+#### The Cox regression coefficients along with the z score and the AIC of the model are calculated for each gene through a loop and the values entered into the empty matrix
+
+####Model (i): for just the batch effects modeled as a random variable 
+for(i in 1:len){
+         coxHer2listrandombatch=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|chrdate), data=datacol)
+                 resmat[c(i),c(1)]=fixef(coxHer2listrandombatch)
+		 resmat[c(i),c(2)]=resmat[c(i),c(1)]/sqrt(diag(vcov(coxHer2listrandombatch)))
+		 resmat[c(i),c(3)]=-2*(coxHer2listrandombatch$loglik[2])+2*coxHer2listrandombatch$df[1]
+   }
+
+####Model (ii): For the study series modeled as a random variable
+for(i in 1:len){
+         coxHer2listrandomseries=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series), data=datacol)
+                 resmat[c(i),c(4)]=fixef(coxHer2listrandomseries)
+		 resmat[c(i),c(5)]=resmat[c(i),c(4)]/sqrt(diag(vcov(coxHer2listrandomseries)))
+		 resmat[c(i),c(6)]=-2*(coxHer2listrandomseries$loglik[2])+2*coxHer2listrandomseries$df[1]
+   }
+
+####Model (iii): For the institution modeled as a random variable
+for(i in 1:len){
+         coxHer2listrandominstitution=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution), data=datacol)
+                 resmat[c(i),c(7)]=fixef(coxHer2listrandominstitution)
+		 resmat[c(i),c(8)]=resmat[c(i),c(7)]/sqrt(diag(vcov(coxHer2listrandominstitution)))
+		 resmat[c(i),c(9)]=-2*(coxHer2listrandominstitution$loglik[2])+2*coxHer2listrandominstitution$df[1]
+   }
+
+####Model (iv): For the batch (as estimated from scan date) nested within the series modeled as a random variable
+for(i in 1:len){
+         coxHer2listrandomnested1=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series/chrdate), data=datacol)
+                 resmat[c(i),c(10)]=fixef(coxHer2listrandomnested1)
+		 resmat[c(i),c(11)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxHer2listrandomnested1)))
+		 resmat[c(i),c(12)]=-2*(coxHer2listrandomnested1$loglik[2])+2*coxHer2listrandomnested1$df[1]
+   }
+
+####Model (v): For the batch (as estimated from scan date) nested within the institution modeled as a random variable
+for(i in 1:len){
+         coxHer2listrandomnested2=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution/chrdate), data=datacol)
+                 resmat[c(i),c(13)]=fixef(coxHer2listrandomnested2)
+		 resmat[c(i),c(14)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxHer2listrandomnested2)))
+		 resmat[c(i),c(15)]=-2*(coxHer2listrandomnested2$loglik[2])+2*coxHer2listrandomnested2$df[1]
+   }
+
+####Model (vi): A marginal model. 
+for(i in 1:len){
+         coxHer2listmarg=coxph(Surv(tdmfs,edmfs)~datacol[,c(i)] +cluster(chrdate), data=datacol)
+		 resmat[c(i),c(16)]=summary(coxHer2listmarg)$coefficients[1,1]
+		 resmat[c(i),c(17)]=summary(coxHer2listmarg)$coefficients[1,4]
+		 resmat[c(i),c(18)]=-2*(coxHer2listmarg$loglik[2])+2 
+                 resmat[c(i),c(19)]=-2*(coxHer2listmarg$loglik[1])
+   }
+
+####The columns of the matrix are named
+colnames(resmat)=c("coefbatch","zscorebatch","AICbatch","coefseries","zscoreseries","AICseries","coefinstitution","zscoreinstitution","AICinstitution","coefnestedseries",
+                      "zscorenestedseries","AICnestedseries","coefnestedinstitution", "zscorenestedinstitution","AICnestedinstitution","coefmarginal","zscoremarginal","AICmarginal","AICnull")
+
+####The results are stored
+resmatHer2=as.data.frame(resmat)
+resmatHer2$gene=colnames(datacol)[1:len]
+write.csv(resmatHer2, "resmatHer2.csv")
+
+
+
+#################################################
+#######  Analysis for Basal subtype   ###########
+################################################# 
+
+#### The expression data and the other data are then separated, since only the expression data will be used for collapsing the probes to genes
+zz=length(colnames(dataBasal))
+data=dataBasal[,c(1:22283)] #### expression data
+demo=dataBasal[,c(22284:zz)]
+
+##### For the collapsing the probes are supposed to be in rows and the samples in columns, so the data has to be transposed
+data=t(data)
+
+#### Only that data representing the probes having a mapping to a Entrez Gene ID are kept. 
+data=data[c(row.names(data) %in% probes),]
+#### The probes are then collapsed to genes. The gene names are represented in the row names
+datacol=(collapseRows(data,genes,probes))[[1]]
+#### The number of genes finally the data is collapsed to 
+len=length(row.names(datacol))
+#### The collapsed  expression data is to be transposed again so that the genes are in the columns which is needed for the cox regression that is to follow
+datacol=t(datacol)
+#### The expression data for the genes are then merged again with the data containing the estimated molecular subtypes, AURKA score, scan date and follow up and event times
+datacol=merge(datacol, demo, by="row.names")
+row.names(datacol)=datacol$Row.names
+datacol$Row.names=NULL 
+
+####Make an empty matrix to store results
+resmat=matrix(nrow=len, ncol=19)
+
+####Model with the scan date serving as a proxy for batch and controlled as a random effects variable in a mixed effects Cox model. 
+#### The Cox regression coefficients along with the z score and the AIC of the model are calculated for each gene through a loop and the values entered into the empty matrix
+
+####Model (i): for just the batch effects modeled as a random variable 
+for(i in 1:len){
+         coxBasallistrandombatch=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|chrdate), data=datacol)
+                 resmat[c(i),c(1)]=fixef(coxBasallistrandombatch)
+		 resmat[c(i),c(2)]=resmat[c(i),c(1)]/sqrt(diag(vcov(coxBasallistrandombatch)))
+		 resmat[c(i),c(3)]=-2*(coxBasallistrandombatch$loglik[2])+2*coxBasallistrandombatch$df[1]
+   }
+
+####Model (ii): For the study series modeled as a random variable
+for(i in 1:len){
+         coxBasallistrandomseries=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series), data=datacol)
+                 resmat[c(i),c(4)]=fixef(coxBasallistrandomseries)
+		 resmat[c(i),c(5)]=resmat[c(i),c(4)]/sqrt(diag(vcov(coxBasallistrandomseries)))
+		 resmat[c(i),c(6)]=-2*(coxBasallistrandomseries$loglik[2])+2*coxBasallistrandomseries$df[1]
+   }
+
+####Model (iii): For the institution modeled as a random variable
+for(i in 1:len){
+         coxBasallistrandominstitution=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution), data=datacol)
+                 resmat[c(i),c(7)]=fixef(coxBasallistrandominstitution)
+		 resmat[c(i),c(8)]=resmat[c(i),c(7)]/sqrt(diag(vcov(coxBasallistrandominstitution)))
+		 resmat[c(i),c(9)]=-2*(coxBasallistrandominstitution$loglik[2])+2*coxBasallistrandominstitution$df[1]
+   }
+
+####Model (iv): For the batch (as estimated from scan date) nested within the series modeled as a random variable
+for(i in 1:len){
+         coxBasallistrandomnested1=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series/chrdate), data=datacol)
+                 resmat[c(i),c(10)]=fixef(coxBasallistrandomnested1)
+		 resmat[c(i),c(11)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxBasallistrandomnested1)))
+		 resmat[c(i),c(12)]=-2*(coxBasallistrandomnested1$loglik[2])+2*coxBasallistrandomnested1$df[1]
+   }
+
+####Model (v): For the batch (as estimated from scan date) nested within the institution modeled as a random variable
+for(i in 1:len){
+         coxBasallistrandomnested2=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution/chrdate), data=datacol)
+                 resmat[c(i),c(13)]=fixef(coxBasallistrandomnested2)
+		 resmat[c(i),c(14)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxBasallistrandomnested2)))
+		 resmat[c(i),c(15)]=-2*(coxBasallistrandomnested2$loglik[2])+2*coxBasallistrandomnested2$df[1]
+   }
+
+####Model (vi): A marginal model. 
+for(i in 1:len){
+         coxBasallistmarg=coxph(Surv(tdmfs,edmfs)~datacol[,c(i)] +cluster(chrdate), data=datacol)
+		 resmat[c(i),c(16)]=summary(coxBasallistmarg)$coefficients[1,1]
+		 resmat[c(i),c(17)]=summary(coxBasallistmarg)$coefficients[1,4]
+		 resmat[c(i),c(18)]=-2*(coxBasallistmarg$loglik[2])+2 
+                 resmat[c(i),c(19)]=-2*(coxBasallistmarg$loglik[1])
+   }
+
+####The columns of the matrix are named
+colnames(resmat)=c("coefbatch","zscorebatch","AICbatch","coefseries","zscoreseries","AICseries","coefinstitution","zscoreinstitution","AICinstitution","coefnestedseries",
+                      "zscorenestedseries","AICnestedseries","coefnestedinstitution", "zscorenestedinstitution","AICnestedinstitution","coefmarginal","zscoremarginal","AICmarginal","AICnull")
+
+####The results are stored
+resmatBasal=as.data.frame(resmat)
+resmatBasal$gene=colnames(datacol)[1:len]
+write.csv(resmatBasal, "resmatBasal.csv")
+
+#################################################
+#######  Analysis for LumA subtype   ###########
+################################################# 
+
+#### The expression data and the other data are then separated, since only the expression data will be used for collapsing the probes to genes
+zz=length(colnames(dataLumA))
+data=dataLumA[,c(1:22283)] #### expression data
+demo=dataLumA[,c(22284:zz)]
+
+##### For the collapsing the probes are supposed to be in rows and the samples in columns, so the data has to be transposed
+data=t(data)
+
+#### Only that data representing the probes having a mapping to a Entrez Gene ID are kept. 
+data=data[c(row.names(data) %in% probes),]
+#### The probes are then collapsed to genes. The gene names are represented in the row names
+datacol=(collapseRows(data,genes,probes))[[1]]
+#### The number of genes finally the data is collapsed to 
+len=length(row.names(datacol))
+#### The collapsed  expression data is to be transposed again so that the genes are in the columns which is needed for the cox regression that is to follow
+datacol=t(datacol)
+#### The expression data for the genes are then merged again with the data containing the estimated molecular subtypes, AURKA score, scan date and follow up and event times
+datacol=merge(datacol, demo, by="row.names")
+row.names(datacol)=datacol$Row.names
+datacol$Row.names=NULL 
+
+####Make an empty matrix to store results
+resmat=matrix(nrow=len, ncol=19)
+
+####Model with the scan date serving as a proxy for batch and controlled as a random effects variable in a mixed effects Cox model. 
+#### The Cox regression coefficients along with the z score and the AIC of the model are calculated for each gene through a loop and the values entered into the empty matrix
+
+####Model (i): for just the batch effects modeled as a random variable 
+for(i in 1:len){
+         coxLumAlistrandombatch=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|chrdate), data=datacol)
+                 resmat[c(i),c(1)]=fixef(coxLumAlistrandombatch)
+		 resmat[c(i),c(2)]=resmat[c(i),c(1)]/sqrt(diag(vcov(coxLumAlistrandombatch)))
+		 resmat[c(i),c(3)]=-2*(coxLumAlistrandombatch$loglik[2])+2*coxLumAlistrandombatch$df[1]
+   }
+
+####Model (ii): For the study series modeled as a random variable
+for(i in 1:len){
+         coxLumAlistrandomseries=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series), data=datacol)
+                 resmat[c(i),c(4)]=fixef(coxLumAlistrandomseries)
+		 resmat[c(i),c(5)]=resmat[c(i),c(4)]/sqrt(diag(vcov(coxLumAlistrandomseries)))
+		 resmat[c(i),c(6)]=-2*(coxLumAlistrandomseries$loglik[2])+2*coxLumAlistrandomseries$df[1]
+   }
+
+####Model (iii): For the institution modeled as a random variable
+for(i in 1:len){
+         coxLumAlistrandominstitution=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution), data=datacol)
+                 resmat[c(i),c(7)]=fixef(coxLumAlistrandominstitution)
+		 resmat[c(i),c(8)]=resmat[c(i),c(7)]/sqrt(diag(vcov(coxLumAlistrandominstitution)))
+		 resmat[c(i),c(9)]=-2*(coxLumAlistrandominstitution$loglik[2])+2*coxLumAlistrandominstitution$df[1]
+   }
+
+####Model (iv): For the batch (as estimated from scan date) nested within the series modeled as a random variable
+for(i in 1:len){
+         coxLumAlistrandomnested1=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series/chrdate), data=datacol)
+                 resmat[c(i),c(10)]=fixef(coxLumAlistrandomnested1)
+		 resmat[c(i),c(11)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxLumAlistrandomnested1)))
+		 resmat[c(i),c(12)]=-2*(coxLumAlistrandomnested1$loglik[2])+2*coxLumAlistrandomnested1$df[1]
+   }
+
+####Model (v): For the batch (as estimated from scan date) nested within the institution modeled as a random variable
+for(i in 1:len){
+         coxLumAlistrandomnested2=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution/chrdate), data=datacol)
+                 resmat[c(i),c(13)]=fixef(coxLumAlistrandomnested2)
+		 resmat[c(i),c(14)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxLumAlistrandomnested2)))
+		 resmat[c(i),c(15)]=-2*(coxLumAlistrandomnested2$loglik[2])+2*coxLumAlistrandomnested2$df[1]
+   }
+
+####Model (vi): A marginal model. 
+for(i in 1:len){
+         coxLumAlistmarg=coxph(Surv(tdmfs,edmfs)~datacol[,c(i)] +cluster(chrdate), data=datacol)
+		 resmat[c(i),c(16)]=summary(coxLumAlistmarg)$coefficients[1,1]
+		 resmat[c(i),c(17)]=summary(coxLumAlistmarg)$coefficients[1,4]
+		 resmat[c(i),c(18)]=-2*(coxLumAlistmarg$loglik[2])+2 
+                 resmat[c(i),c(19)]=-2*(coxLumAlistmarg$loglik[1])
+   }
+
+####The columns of the matrix are named
+colnames(resmat)=c("coefbatch","zscorebatch","AICbatch","coefseries","zscoreseries","AICseries","coefinstitution","zscoreinstitution","AICinstitution","coefnestedseries",
+                      "zscorenestedseries","AICnestedseries","coefnestedinstitution", "zscorenestedinstitution","AICnestedinstitution","coefmarginal","zscoremarginal","AICmarginal","AICnull")
+
+####The results are stored
+resmatLumA=as.data.frame(resmat)
+resmatLumA$gene=colnames(datacol)[1:len]
+write.csv(resmatLumA, "resmatLumA.csv")
+
+#################################################
+#######  Analysis for LumB subtype   ###########
+################################################# 
+
+#### The expression data and the other data are then separated, since only the expression data will be used for collapsing the probes to genes
+zz=length(colnames(dataLumB))
+data=dataLumB[,c(1:22283)] #### expression data
+demo=dataLumB[,c(22284:zz)]
+
+##### For the collapsing the probes are supposed to be in rows and the samples in columns, so the data has to be transposed
+data=t(data)
+
+#### Only that data representing the probes having a mapping to a Entrez Gene ID are kept. 
+data=data[c(row.names(data) %in% probes),]
+#### The probes are then collapsed to genes. The gene names are represented in the row names
+datacol=(collapseRows(data,genes,probes))[[1]]
+#### The number of genes finally the data is collapsed to 
+len=length(row.names(datacol))
+#### The collapsed  expression data is to be transposed again so that the genes are in the columns which is needed for the cox regression that is to follow
+datacol=t(datacol)
+#### The expression data for the genes are then merged again with the data containing the estimated molecular subtypes, AURKA score, scan date and follow up and event times
+datacol=merge(datacol, demo, by="row.names")
+row.names(datacol)=datacol$Row.names
+datacol$Row.names=NULL 
+
+####Make an empty matrix to store results
+resmat=matrix(nrow=len, ncol=19)
+
+####Model with the scan date serving as a proxy for batch and controlled as a random effects variable in a mixed effects Cox model. 
+#### The Cox regression coefficients along with the z score and the AIC of the model are calculated for each gene through a loop and the values entered into the empty matrix
+
+####Model (i): for just the batch effects modeled as a random variable 
+for(i in 1:len){
+         coxLumBlistrandombatch=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|chrdate), data=datacol)
+                 resmat[c(i),c(1)]=fixef(coxLumBlistrandombatch)
+		 resmat[c(i),c(2)]=resmat[c(i),c(1)]/sqrt(diag(vcov(coxLumBlistrandombatch)))
+		 resmat[c(i),c(3)]=-2*(coxLumBlistrandombatch$loglik[2])+2*coxLumBlistrandombatch$df[1]
+   }
+
+####Model (ii): For the study series modeled as a random variable
+for(i in 1:len){
+         coxLumBlistrandomseries=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series), data=datacol)
+                 resmat[c(i),c(4)]=fixef(coxLumBlistrandomseries)
+		 resmat[c(i),c(5)]=resmat[c(i),c(4)]/sqrt(diag(vcov(coxLumBlistrandomseries)))
+		 resmat[c(i),c(6)]=-2*(coxLumBlistrandomseries$loglik[2])+2*coxLumBlistrandomseries$df[1]
+   }
+
+####Model (iii): For the institution modeled as a random variable
+for(i in 1:len){
+         coxLumBlistrandominstitution=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution), data=datacol)
+                 resmat[c(i),c(7)]=fixef(coxLumBlistrandominstitution)
+		 resmat[c(i),c(8)]=resmat[c(i),c(7)]/sqrt(diag(vcov(coxLumBlistrandominstitution)))
+		 resmat[c(i),c(9)]=-2*(coxLumBlistrandominstitution$loglik[2])+2*coxLumBlistrandominstitution$df[1]
+   }
+
+####Model (iv): For the batch (as estimated from scan date) nested within the series modeled as a random variable
+for(i in 1:len){
+         coxLumBlistrandomnested1=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|series/chrdate), data=datacol)
+                 resmat[c(i),c(10)]=fixef(coxLumBlistrandomnested1)
+		 resmat[c(i),c(11)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxLumBlistrandomnested1)))
+		 resmat[c(i),c(12)]=-2*(coxLumBlistrandomnested1$loglik[2])+2*coxLumBlistrandomnested1$df[1]
+   }
+
+####Model (v): For the batch (as estimated from scan date) nested within the institution modeled as a random variable
+for(i in 1:len){
+         coxLumBlistrandomnested2=coxme(Surv(tdmfs,edmfs)~datacol[,c(i)]+(1|institution/chrdate), data=datacol)
+                 resmat[c(i),c(13)]=fixef(coxLumBlistrandomnested2)
+		 resmat[c(i),c(14)]=resmat[c(i),c(10)]/sqrt(diag(vcov(coxLumBlistrandomnested2)))
+		 resmat[c(i),c(15)]=-2*(coxLumBlistrandomnested2$loglik[2])+2*coxLumBlistrandomnested2$df[1]
+   }
+
+####Model (vi): A marginal model. 
+for(i in 1:len){
+         coxLumBlistmarg=coxph(Surv(tdmfs,edmfs)~datacol[,c(i)] +cluster(chrdate), data=datacol)
+		 resmat[c(i),c(16)]=summary(coxLumBlistmarg)$coefficients[1,1]
+		 resmat[c(i),c(17)]=summary(coxLumBlistmarg)$coefficients[1,4]
+		 resmat[c(i),c(18)]=-2*(coxLumBlistmarg$loglik[2])+2 
+                 resmat[c(i),c(19)]=-2*(coxLumBlistmarg$loglik[1])
+   }
+
+####The columns of the matrix are named
+colnames(resmat)=c("coefbatch","zscorebatch","AICbatch","coefseries","zscoreseries","AICseries","coefinstitution","zscoreinstitution","AICinstitution","coefnestedseries",
+                      "zscorenestedseries","AICnestedseries","coefnestedinstitution", "zscorenestedinstitution","AICnestedinstitution","coefmarginal","zscoremarginal","AICmarginal","AICnull")
+
+####The results are stored
+resmatLumB=as.data.frame(resmat)
+resmatLumB$gene=colnames(datacol)[1:len]
+write.csv(resmatLumB, "resmatLumB.csv")
+
+#####Make the .rnk files for GSEA. Since the AIC values for models in which random effects variables using just the batch
+#####give the lowest values, the coefficients from these models will be used to make the ranked lists.
+##### The files may be ranked in R itself,but the ranking is also taken care of by the GSEA software and is therefore unnecessary
+Her2randbatch=resmatHer2[,c("gene","coefbatch")]
+names(Her2randbatch)=c("#gene","")
+write.table(Her2randbatch, file="Her2randbatch.rnk",quote=FALSE, sep="\t", row.names=FALSE, col.names=TRUE)
+
+Basalrandbatch=resmatBasal[,c("gene","coefbatch")]
+names(Basalrandbatch)=c("#gene","")
+write.table(Basalrandbatch, file="Basalrandbatch.rnk",quote=FALSE, sep="\t", row.names=FALSE, col.names=TRUE)
+
+LumBrandbatch=resmatLumB[,c("gene","coefbatch")]
+names(LumBrandbatch)=c("#gene","")
+write.table(LumBrandbatch, file="LumBrandbatch.rnk",quote=FALSE, sep="\t", row.names=FALSE, col.names=TRUE)
+
+combunivrandbatch=resmatcombuniv[,c("gene","coefbatch")]
+names(combunivrandbatch)=c("#gene","")
+write.table(combunivrandbatch, file="combunivrandbatch.rnk",quote=FALSE, sep="\t", row.names=FALSE, col.names=TRUE)
+
+aurkarandbatch=resmataurka[,c("gene","coefbatch")]
+names(aurkarandbatch)=c("#gene","")
+write.table(aurkarandbatch, file="aurkarandbatch.rnk",quote=FALSE, sep="\t", row.names=FALSE, col.names=TRUE)
+
+LumArandnestedinstitution=resmatLumA[,c("gene","coefnestedinstitution")]
+names(LumArandnestedinstitution)=c("#gene","")
+write.table(LumArandnestedinstitution, file="resmatLumAnestedinstitutionlap.rnk",quote=FALSE, sep="\t", row.names=FALSE, col.names=TRUE)
+
+
+
+###################How to get he scan date for batch effects (Uncomment before using the relevant code
+#####################The scan date used as the surrogate for batch was used by the following code
+####################### Now, there will be RMA processing for all the data series and extraction of the scan date which will serve as a proxy for batch
+####
+####
+#### RMA processing and extraction for GSE11121 
+#setwd(paste(getwd(),"/MAINZ",sep=""))
+#### RMA pre-processing 
+#mainzdata=justRMA(verbose=TRUE, filenames=celsmainz)
+#### Extraction of scan date with naming of the same by the sample names and conversion of the scan date as a character vector 
+#mainzscandate=protocolData(mainzdata)$ScanDate
+# names(mainzscandate)=sampleNames(protocolData(mainzdata))
+# mainzscandate=as.data.frame(mainzscandate)
+# mainzscandate$moddate=with(mainzscandate, as.Date(mainzscandate, "%m/%d/%y %H:%M:%S"))
+# mainzscandate$chrdate=with(mainzscandate, as.character(moddate))
+# ####Make a variable for sample name. Since I wanted to remove the ".cel" or ".CEL" associated with the Sample name, gsub was used   
+# mainzscandate$Samplename=row.names(mainzscandate)
+# mainzscandate$Samplename=gsub(".cel", "", mainzscandate$Samplename, ignore.case = TRUE, perl = FALSE)
+# ####series refers to the GSE series , institution refers to the institution in which the study was carried out. In case of GSE11121, both are the same
+# mainzscandate$series="MAINZ"
+# mainzscandate$institution="MAINZ"
+
+# #### RMA processing and extraction for GSE7390
+# setwd("../")
+# setwd(paste(getwd(),"/TRANSBIG",sep=""))
+# #### RMA pre-processing 
+# transbigdata=justRMA(verbose=TRUE, filenames=celstransbig)
+# #### Extraction of scan date with naming of the same by the sample names and conversion of the scan date as a character vector 
+# transbigscandate=protocolData(transbigdata)$ScanDate
+# names(transbigscandate)=sampleNames(protocolData(transbigdata))
+# transbigscandate=as.data.frame(transbigscandate)
+# transbigscandate$moddate=with(transbigscandate, as.Date(transbigscandate, "%m/%d/%y %H:%M:%S"))
+# transbigscandate$chrdate=with(transbigscandate, as.character(moddate))
+# ####Make a variable for sample name. Since I wanted to remove the ".cel" or ".CEL" associated with the Sample name, gsub was used   
+# transbigscandate$Samplename=row.names(transbigscandate)
+# transbigscandate$Samplename=gsub(".cel", "", transbigscandate$Samplename, ignore.case = TRUE, perl = FALSE)
+# ####series refers to the GSE series , institution refers to the institution in which the study was carried out. In case of GSE7390, both are the same
+# transbigscandate$series="TRANSBIG"
+# transbigscandate$institution="TRANSBIG"
+
+# #### RMA processing and extraction for GSE2034
+# setwd("../")
+# setwd(paste(getwd(),"/EMC1",sep=""))
+# #### RMA pre-processing 
+# emc1data=justRMA(verbose=TRUE, filenames=celsemc1)
+# #### Extraction of scan date with naming of the same by the sample names and conversion of the scan date as a character vector
+# emc1scandate=protocolData(emc1data)$ScanDate
+# names(emc1scandate)=sampleNames(protocolData(emc1data))
+# emc1scandate=as.data.frame(emc1scandate)
+# emc1scandate$moddate=with(emc1scandate, as.Date(emc1scandate, "%m/%d/%y %H:%M:%S"))
+# emc1scandate$chrdate=with(emc1scandate, as.character(moddate))
+# ####Make a variable for sample name. Since I wanted to remove the ".cel" or ".CEL" associated with the Sample name, gsub was used
+# emc1scandate$Samplename=row.names(emc1scandate)
+# emc1scandate$Samplename=gsub(".cel", "", emc1scandate$Samplename, ignore.case = TRUE, perl = FALSE)
+# ####series refers to the GSE series , institution refers to the institution in which the study was carried out. 
+# ####In case of GSE2034 and GSE5327, both the series were from the same institution, so they will be coded the same for the variable "institution"
+# emc1scandate$series="EMC1"
+# emc1scandate$institution="EMC"
+
+# #### RMA processing and extraction for GSE5327
+# setwd("../")
+# setwd(paste(getwd(),"/EMC2",sep=""))
+# #### RMA pre-processing
+# emc2data=justRMA(verbose=TRUE, filenames=celsemc2)
+# #### Extraction of scan date with naming of the same by the sample names and conversion of the scan date as a character vector
+# emc2scandate=protocolData(emc2data)$ScanDate
+# names(emc2scandate)=sampleNames(protocolData(emc2data))
+# emc2scandate=as.data.frame(emc2scandate)
+# emc2scandate$moddate=with(emc2scandate, as.Date(emc2scandate, "%m/%d/%y %H:%M:%S"))
+# emc2scandate$chrdate=with(emc2scandate, as.character(moddate))
+# ####Make a variable for sample name. Since I wanted to remove the ".cel" or ".CEL" associated with the Sample name, gsub was used
+# emc2scandate$Samplename=row.names(emc2scandate)
+# emc2scandate$Samplename=gsub(".cel", "", emc2scandate$Samplename, ignore.case = TRUE, perl = FALSE)
+# totscan=rbind(mainzscandate,transbigscandate,emc1scandate,emc2scandate)
+####The dataframe totscan contains the scan date as a date variable as well as a character variable
+
+
+
+
+
+
+
